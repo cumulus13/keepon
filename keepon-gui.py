@@ -1,4 +1,7 @@
+#!/usr/bin/env python
+
 import sys
+import os
 import ctypes
 import time
 from threading import Thread, Event
@@ -16,6 +19,13 @@ def prevent_sleep():
 
 def allow_sleep():
     ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+    
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and PyInstaller"""
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
 
 class SleepPreventer(Thread):
     def __init__(self):
@@ -44,7 +54,7 @@ class TrayApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
         self.tray = QSystemTrayIcon()
-        self.tray.setIcon(QIcon("icons/heart.ico"))  # Ganti dengan path ikonmu jika ingin custom
+        self.tray.setIcon(QIcon(resource_path("icons/heart.ico")))  # Ganti dengan path ikonmu jika ingin custom
         self.tray.setVisible(True)
 
         # Worker thread
@@ -53,9 +63,9 @@ class TrayApp:
 
         # Menu
         self.menu = QMenu()
-        self.start_action = QAction(QIcon("icons/start.ico"), "Start")
-        self.stop_action = QAction(QIcon("icons/stop.ico"), "Stop")
-        self.exit_action = QAction(QIcon("icons/exit.ico"), "Exit")
+        self.start_action = QAction(QIcon(resource_path("icons/start.ico")), "Start")
+        self.stop_action = QAction(QIcon(resource_path("icons/stop.ico")), "Stop")
+        self.exit_action = QAction(QIcon(resource_path("icons/exit.ico")), "Exit")
 
         self.start_action.triggered.connect(self.start_keep_alive)
         self.stop_action.triggered.connect(self.stop_keep_alive)
