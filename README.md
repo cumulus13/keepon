@@ -30,6 +30,8 @@ KeepOn GUI is a Python application that prevents your computer from going to sle
    python keepon-gui.py
    #or console app
    python keepon.py
+   #or you can run file *.exe (gui app ~ download from release page)
+   keepon.exe
    ```
 
 ## Usage
