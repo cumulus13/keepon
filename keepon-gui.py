@@ -82,10 +82,12 @@ class TrayApp:
 
     def start_keep_alive(self):
         self.preventer.start_prevention()
+        self.tray.setIcon(QIcon(resource_path("icons/heart.ico")))
         self.tray.showMessage("Stay Awake", "Prevention Started", QSystemTrayIcon.Information)
 
     def stop_keep_alive(self):
         self.preventer.pause_prevention()
+        self.tray.setIcon(QIcon(resource_path("icons/heart_cross.ico")))
         self.tray.showMessage("Stay Awake", "Prevention Stopped", QSystemTrayIcon.Information)
 
     def exit_app(self):
