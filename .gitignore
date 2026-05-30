@@ -4,3 +4,6 @@ __pycache__/
 *.spec
 *.exe
 build1/
+
+# Ignore Sublime Text project files
+*.sublime-*

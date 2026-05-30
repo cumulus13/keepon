@@ -1,12 +1,18 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+
+# File: keepon-gui.pyw
+# Author: Hadi Cahyadi <cumulus13@gmail.com>
+# Date: 2026-05-30
+# Description: 
+# License: MIT
 
 import sys
 import os
 import ctypes
 import time
 from threading import Thread, Event
-from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction
-from PyQt5.QtGui import QIcon
+from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction  # type: ignore
+from PyQt5.QtGui import QIcon  # type: ignore
 
 # Constants untuk Windows API
 ES_CONTINUOUS       = 0x80000000
@@ -23,7 +29,7 @@ def allow_sleep():
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and PyInstaller"""
     if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, relative_path)
+        return os.path.join(sys._MEIPASS, relative_path)  # type: ignore
     return os.path.join(os.path.abspath("."), relative_path)
 
 
