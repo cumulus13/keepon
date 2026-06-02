@@ -45,6 +45,7 @@ SW_MAXIMIZE         = 3
 SW_SHOWNORMAL       = 1
 
 HWND_TOP            = 0   # not a HWND object — pass as c_void_p / int
+# HWND_TOPMOST        = -1  # Add this if you want the window to stay on top
 
 SWP_NOSIZE          = 0x0001
 SWP_NOMOVE          = 0x0002
@@ -195,6 +196,66 @@ def find_windows_by_title(pattern: str) -> List[int]:
 #      guarantee — even if any intermediate call changed showCmd, this
 #      restores it to the value captured in step 1.
 # ─────────────────────────────────────────────────────────────────────────────
+# def bring_to_front_preserve_state(hwnd: int) -> bool:
+#     try:
+#         # ── 1. Snapshot the current placement ────────────────────────────────
+#         wp = WINDOWPLACEMENT()
+#         wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+#         if not _u32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+#             log.warning("GetWindowPlacement failed hwnd=%s err=%s",
+#                         hwnd, _k32.GetLastError())
+#             return False
+#         original_show_cmd = wp.showCmd
+#         log.debug("hwnd=%s showCmd=%s before raise", hwnd, original_show_cmd)
+
+#         # ── 2. Attach input queues so foreground lock is bypassed ─────────────
+#         fg_hwnd   = _u32.GetForegroundWindow()
+#         fg_tid    = _u32.GetWindowThreadProcessId(fg_hwnd, None)
+#         target_tid = _u32.GetWindowThreadProcessId(hwnd, None)
+#         our_tid   = _k32.GetCurrentThreadId()
+
+#         attached_fg     = False
+#         attached_target = False
+
+#         if fg_tid and fg_tid != our_tid:
+#             attached_fg = bool(_u32.AttachThreadInput(our_tid, fg_tid, True))
+#         if target_tid and target_tid != our_tid and target_tid != fg_tid:
+#             attached_target = bool(_u32.AttachThreadInput(our_tid, target_tid, True))
+
+#         try:
+#             # ── 3. Un-minimise if needed (SW_RESTORE is safe; see docstring) ──
+#             if _u32.IsIconic(hwnd):
+#                 _u32.ShowWindow(hwnd, SW_RESTORE)
+
+#             # ── 4. Raise Z-order + show without activation ────────────────────
+#             _u32.BringWindowToTop(hwnd)
+#             _u32.SetWindowPos(
+#                 hwnd, HWND_TOP,
+#                 0, 0, 0, 0,
+#                 SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE |
+#                 SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+#             )
+
+#             # ── 5. Actually set foreground (works because threads are attached) 
+#             _u32.SetForegroundWindow(hwnd)
+
+#         finally:
+#             # ── 6. Always detach, even on exception ───────────────────────────
+#             if attached_fg:
+#                 _u32.AttachThreadInput(our_tid, fg_tid, False)
+#             if attached_target:
+#                 _u32.AttachThreadInput(our_tid, target_tid, False)
+
+#         # ── 7. Unconditionally restore placement → state cannot have changed ──
+#         _u32.SetWindowPlacement(hwnd, ctypes.byref(wp))
+
+#         log.debug("hwnd=%s raised; showCmd restored to %s", hwnd, original_show_cmd)
+#         return True
+
+#     except Exception:
+#         log.error("bring_to_front_preserve_state error:\n%s", traceback.format_exc())
+#         return False
+
 def bring_to_front_preserve_state(hwnd: int) -> bool:
     try:
         # ── 1. Snapshot the current placement ────────────────────────────────
@@ -213,7 +274,7 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
         target_tid = _u32.GetWindowThreadProcessId(hwnd, None)
         our_tid   = _k32.GetCurrentThreadId()
 
-        attached_fg     = False
+        attached_fg   = False
         attached_target = False
 
         if fg_tid and fg_tid != our_tid:
@@ -222,12 +283,17 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
             attached_target = bool(_u32.AttachThreadInput(our_tid, target_tid, True))
 
         try:
-            # ── 3. Un-minimise if needed (SW_RESTORE is safe; see docstring) ──
+            # ── 3. Handle visibility without activating ───────────────────────
             if _u32.IsIconic(hwnd):
-                _u32.ShowWindow(hwnd, SW_RESTORE)
+                # If minimized, show it without giving it focus
+                _u32.ShowWindow(hwnd, 4)  # 4 = SW_SHOWNOACTIVATE
+            else:
+                # If already visible (Normal or Maximized), just ensure it's visible without focus
+                _u32.ShowWindow(hwnd, 8)  # 8 = SW_SHOWNA
 
-            # ── 4. Raise Z-order + show without activation ────────────────────
-            _u32.BringWindowToTop(hwnd)
+            # ── 4. Raise Z-order safely ──────────────────────────────────────
+            # This shifts the window to the top layout layer without moving, 
+            # resizing, or activating it. Your typing focus stays on the old window.
             _u32.SetWindowPos(
                 hwnd, HWND_TOP,
                 0, 0, 0, 0,
@@ -235,20 +301,22 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
                 SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
             )
 
-            # ── 5. Actually set foreground (works because threads are attached) 
-            _u32.SetForegroundWindow(hwnd)
-
         finally:
-            # ── 6. Always detach, even on exception ───────────────────────────
+            # ── 5. Always detach input threads ───────────────────────────────
             if attached_fg:
                 _u32.AttachThreadInput(our_tid, fg_tid, False)
             if attached_target:
                 _u32.AttachThreadInput(our_tid, target_tid, False)
 
-        # ── 7. Unconditionally restore placement → state cannot have changed ──
-        _u32.SetWindowPlacement(hwnd, ctypes.byref(wp))
+        # ── 6. State-Preservation Condition ──────────────────────────────────
+        # FIX: If the window was already MAXIMIZED, calling SetWindowPlacement 
+        # breaks the layout. We ONLY restore placement if it wasn't maximized.
+        if original_show_cmd != SW_MAXIMIZE:
+            _u32.SetWindowPlacement(hwnd, ctypes.byref(wp))
+        else:
+            log.debug("hwnd=%s is maximized; skipping SetWindowPlacement to prevent unwanted resizing", hwnd)
 
-        log.debug("hwnd=%s raised; showCmd restored to %s", hwnd, original_show_cmd)
+        log.debug("hwnd=%s successfully processed without focus theft or structural changes", hwnd)
         return True
 
     except Exception:
@@ -507,7 +575,7 @@ class TrayApp:
 
         self.start_action  = QAction(QIcon(resource_path("icons/start.ico")), "Start")
         self.stop_action   = QAction(QIcon(resource_path("icons/stop.ico")),  "Stop")
-        self.reload_action = QAction("Reload Config")
+        self.reload_action = QAction(QIcon(resource_path("icons/reload.ico")), "Reload Config")
         self.exit_action   = QAction(QIcon(resource_path("icons/exit.ico")),  "Exit")
 
         self.start_action.triggered.connect(self.start_keep_alive)
