@@ -214,20 +214,9 @@ def find_windows_by_title(pattern: str) -> List[int]:
     return [h for h, t in results if pl in t.lower()]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bring window to front — state-preserving, focus-theft-free
-#
-# Fix summary vs original:
-#   • SW_SHOWNOACTIVATE (4) used for BOTH the minimised and non-minimised
-#     branch.  Unlike SW_SHOWNA (8), it also un-hides a window that is
-#     invisible but not minimised (WS_VISIBLE=0).
-#   • SetWindowPlacement is skipped only for maximised windows (prevents
-#     the OS collapsing them to their saved normal rect).
-#   • SetForegroundWindow removed — we want Z-order raise, not focus theft.
-# ─────────────────────────────────────────────────────────────────────────────
 def bring_to_front_preserve_state(hwnd: int) -> bool:
     try:
-        # ── 1. Snapshot placement ────────────────────────────────────────────
+        # ── 1. Snapshot the current placement ────────────────────────────────
         wp = WINDOWPLACEMENT()
         wp.length = ctypes.sizeof(WINDOWPLACEMENT)
         if not _u32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
@@ -237,13 +226,13 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
         original_show_cmd = wp.showCmd
         log.debug("hwnd=%s showCmd=%s before raise", hwnd, original_show_cmd)
 
-        # ── 2. Attach input queues to bypass foreground lock ─────────────────
-        fg_hwnd    = _u32.GetForegroundWindow()
-        fg_tid     = _u32.GetWindowThreadProcessId(fg_hwnd, None)
+        # ── 2. Attach input queues so foreground lock is bypassed ─────────────
+        fg_hwnd   = _u32.GetForegroundWindow()
+        fg_tid    = _u32.GetWindowThreadProcessId(fg_hwnd, None)
         target_tid = _u32.GetWindowThreadProcessId(hwnd, None)
-        our_tid    = _k32.GetCurrentThreadId()
+        our_tid   = _k32.GetCurrentThreadId()
 
-        attached_fg     = False
+        attached_fg   = False
         attached_target = False
 
         if fg_tid and fg_tid != our_tid:
@@ -252,12 +241,17 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
             attached_target = bool(_u32.AttachThreadInput(our_tid, target_tid, True))
 
         try:
-            # ── 3. Make visible without stealing focus ───────────────────────
-            # SW_SHOWNOACTIVATE (4) handles minimised, normal, maximised, AND
-            # hidden (WS_VISIBLE=0) windows — SW_SHOWNA (8) misses the last case.
-            _u32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+            # ── 3. Handle visibility without activating ───────────────────────
+            if _u32.IsIconic(hwnd):
+                # If minimized, show it without giving it focus
+                _u32.ShowWindow(hwnd, 4)  # 4 = SW_SHOWNOACTIVATE
+            else:
+                # If already visible (Normal or Maximized), just ensure it's visible without focus
+                _u32.ShowWindow(hwnd, 8)  # 8 = SW_SHOWNA
 
-            # ── 4. Raise Z-order without size/move/activation ────────────────
+            # ── 4. Raise Z-order safely ──────────────────────────────────────
+            # This shifts the window to the top layout layer without moving,
+            # resizing, or activating it. Your typing focus stays on the old window.
             _u32.SetWindowPos(
                 hwnd, HWND_TOP,
                 0, 0, 0, 0,
@@ -266,25 +260,21 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
             )
 
         finally:
-            # ── 5. Always detach, even on exception ──────────────────────────
+            # ── 5. Always detach input threads ───────────────────────────────
             if attached_fg:
                 _u32.AttachThreadInput(our_tid, fg_tid, False)
             if attached_target:
                 _u32.AttachThreadInput(our_tid, target_tid, False)
 
-        # ── 6. Restore placement — but NEVER for maximised windows ───────────
-        # Calling SetWindowPlacement on a maximised window forces it to its
-        # saved normal rect, collapsing it.  Skip it; the window is already
-        # in the correct visual state.
+        # ── 6. State-Preservation Condition ──────────────────────────────────
+        # FIX: If the window was already MAXIMIZED, calling SetWindowPlacement
+        # breaks the layout. We ONLY restore placement if it wasn't maximized.
         if original_show_cmd != SW_MAXIMIZE:
             _u32.SetWindowPlacement(hwnd, ctypes.byref(wp))
         else:
-            log.debug(
-                "hwnd=%s maximised — skipping SetWindowPlacement to prevent collapse",
-                hwnd,
-            )
+            log.debug("hwnd=%s is maximized; skipping SetWindowPlacement to prevent unwanted resizing", hwnd)
 
-        log.debug("hwnd=%s raised without focus theft", hwnd)
+        log.debug("hwnd=%s successfully processed without focus theft or structural changes", hwnd)
         return True
 
     except Exception:
