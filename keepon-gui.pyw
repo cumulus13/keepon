@@ -24,12 +24,42 @@ from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction  # typ
 from PyQt5.QtGui import QIcon  # type: ignore
 from PyQt5.QtCore import QFileSystemWatcher, QTimer, pyqtSignal, QObject  # type: ignore
 
+try:
+    from gntplib import Publisher  # type: ignore
+    _growl_icon = Path(__file__).parent / "icons" / "heart.png"
+    growl = Publisher(  # type: ignore
+        "KeepOn",
+        ["info", "error", "warning", "debug", "reload", "run"],
+        icon=str(_growl_icon),
+    )
+    try:
+        growl.register()
+    except Exception:
+        pass
+    HAS_GNTPLIB = True
+except Exception as e:
+    print(f"[GNTPLIB:WARN] gntplib unavailable — Growl notifications disabled: {e}")
+    HAS_GNTPLIB = False
+
+
+def _growl(level: str, title: str, message: str) -> None:
+    """Central growl helper — no-ops cleanly when gntplib is absent."""
+    if HAS_GNTPLIB:
+        try:
+            growl.publish(level, title, message)
+        except Exception as exc:
+            log.debug("growl.publish failed: %s", exc)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging — set up early; level/file overridden after config load
 # ─────────────────────────────────────────────────────────────────────────────
 _LOG_FMT = "%(asctime)s [%(levelname)s] %(message)s"
-logging.basicConfig(level=logging.DEBUG, format=_LOG_FMT,
-                    handlers=[logging.StreamHandler(sys.stdout)])
+logging.basicConfig(
+    level=logging.DEBUG,
+    format=_LOG_FMT,
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 log = logging.getLogger("keepon")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,13 +69,10 @@ ES_CONTINUOUS       = 0x80000000
 ES_SYSTEM_REQUIRED  = 0x00000001
 ES_DISPLAY_REQUIRED = 0x00000002
 
-SW_RESTORE          = 9   # un-minimise; maximised → stays maximised
-SW_MINIMIZE         = 6
+SW_SHOWNOACTIVATE   = 4   # show (any state → visible) without stealing focus
 SW_MAXIMIZE         = 3
-SW_SHOWNORMAL       = 1
 
-HWND_TOP            = 0   # not a HWND object — pass as c_void_p / int
-# HWND_TOPMOST        = -1  # Add this if you want the window to stay on top
+HWND_TOP            = 0
 
 SWP_NOSIZE          = 0x0001
 SWP_NOMOVE          = 0x0002
@@ -54,17 +81,18 @@ SWP_NOOWNERZORDER   = 0x0200
 SWP_SHOWWINDOW      = 0x0040
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Windows API — structs  (all integer fields are 32-bit on Windows regardless
-# of host arch, so we use c_int32 / c_uint32 explicitly)
+# Windows API — structs
 # ─────────────────────────────────────────────────────────────────────────────
 class _POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_int32), ("y", ctypes.c_int32)]
+
 
 class _RECT(ctypes.Structure):
     _fields_ = [
         ("left",   ctypes.c_int32), ("top",    ctypes.c_int32),
         ("right",  ctypes.c_int32), ("bottom", ctypes.c_int32),
     ]
+
 
 class WINDOWPLACEMENT(ctypes.Structure):
     """44 bytes on all Windows targets."""
@@ -77,64 +105,66 @@ class WINDOWPLACEMENT(ctypes.Structure):
         ("rcNormalPosition", _RECT),
     ]
 
+
 class LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_uint32), ("dwTime", ctypes.c_uint32)]
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Windows API — function references with explicit argtypes / restype
-# (prevents silent truncation of handles on 64-bit)
 # ─────────────────────────────────────────────────────────────────────────────
 _u32 = ctypes.windll.user32
 _k32 = ctypes.windll.kernel32
 
-_u32.GetWindowPlacement.argtypes  = [ctypes.wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
-_u32.GetWindowPlacement.restype   = ctypes.wintypes.BOOL
-_u32.SetWindowPlacement.argtypes  = [ctypes.wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
-_u32.SetWindowPlacement.restype   = ctypes.wintypes.BOOL
-_u32.SetWindowPos.argtypes        = [
+_u32.GetWindowPlacement.argtypes   = [ctypes.wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+_u32.GetWindowPlacement.restype    = ctypes.wintypes.BOOL
+_u32.SetWindowPlacement.argtypes   = [ctypes.wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT)]
+_u32.SetWindowPlacement.restype    = ctypes.wintypes.BOOL
+_u32.SetWindowPos.argtypes         = [
     ctypes.wintypes.HWND, ctypes.wintypes.HWND,
     ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
     ctypes.c_uint,
 ]
-_u32.SetWindowPos.restype         = ctypes.wintypes.BOOL
-_u32.ShowWindow.argtypes          = [ctypes.wintypes.HWND, ctypes.c_int]
-_u32.ShowWindow.restype           = ctypes.wintypes.BOOL
-_u32.BringWindowToTop.argtypes    = [ctypes.wintypes.HWND]
-_u32.BringWindowToTop.restype     = ctypes.wintypes.BOOL
-_u32.SetForegroundWindow.argtypes = [ctypes.wintypes.HWND]
-_u32.SetForegroundWindow.restype  = ctypes.wintypes.BOOL
-_u32.GetForegroundWindow.argtypes = []
-_u32.GetForegroundWindow.restype  = ctypes.wintypes.HWND
+_u32.SetWindowPos.restype          = ctypes.wintypes.BOOL
+_u32.ShowWindow.argtypes           = [ctypes.wintypes.HWND, ctypes.c_int]
+_u32.ShowWindow.restype            = ctypes.wintypes.BOOL
+_u32.BringWindowToTop.argtypes     = [ctypes.wintypes.HWND]
+_u32.BringWindowToTop.restype      = ctypes.wintypes.BOOL
+_u32.SetForegroundWindow.argtypes  = [ctypes.wintypes.HWND]
+_u32.SetForegroundWindow.restype   = ctypes.wintypes.BOOL
+_u32.GetForegroundWindow.argtypes  = []
+_u32.GetForegroundWindow.restype   = ctypes.wintypes.HWND
 _u32.GetWindowThreadProcessId.argtypes = [
     ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD)
 ]
 _u32.GetWindowThreadProcessId.restype  = ctypes.wintypes.DWORD
-_u32.AttachThreadInput.argtypes   = [
+_u32.AttachThreadInput.argtypes    = [
     ctypes.wintypes.DWORD, ctypes.wintypes.DWORD, ctypes.wintypes.BOOL
 ]
-_u32.AttachThreadInput.restype    = ctypes.wintypes.BOOL
-_u32.IsWindowVisible.argtypes     = [ctypes.wintypes.HWND]
-_u32.IsWindowVisible.restype      = ctypes.wintypes.BOOL
-_u32.IsIconic.argtypes            = [ctypes.wintypes.HWND]
-_u32.IsIconic.restype             = ctypes.wintypes.BOOL
+_u32.AttachThreadInput.restype     = ctypes.wintypes.BOOL
+_u32.IsWindowVisible.argtypes      = [ctypes.wintypes.HWND]
+_u32.IsWindowVisible.restype       = ctypes.wintypes.BOOL
+_u32.IsIconic.argtypes             = [ctypes.wintypes.HWND]
+_u32.IsIconic.restype              = ctypes.wintypes.BOOL
 _u32.GetWindowTextLengthW.argtypes = [ctypes.wintypes.HWND]
 _u32.GetWindowTextLengthW.restype  = ctypes.c_int
-_u32.GetWindowTextW.argtypes      = [ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR, ctypes.c_int]
-_u32.GetWindowTextW.restype       = ctypes.c_int
-_u32.EnumWindows.argtypes         = [ctypes.WINFUNCTYPE(ctypes.c_bool,
-                                        ctypes.wintypes.HWND, ctypes.py_object),
-                                     ctypes.py_object]
-_u32.EnumWindows.restype          = ctypes.wintypes.BOOL
-_u32.GetLastInputInfo.argtypes    = [ctypes.POINTER(LASTINPUTINFO)]
-_u32.GetLastInputInfo.restype     = ctypes.wintypes.BOOL
+_u32.GetWindowTextW.argtypes       = [ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR, ctypes.c_int]
+_u32.GetWindowTextW.restype        = ctypes.c_int
+_u32.EnumWindows.argtypes          = [
+    ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.py_object),
+    ctypes.py_object,
+]
+_u32.EnumWindows.restype           = ctypes.wintypes.BOOL
+_u32.GetLastInputInfo.argtypes     = [ctypes.POINTER(LASTINPUTINFO)]
+_u32.GetLastInputInfo.restype      = ctypes.wintypes.BOOL
 _k32.SetThreadExecutionState.argtypes = [ctypes.c_uint32]
 _k32.SetThreadExecutionState.restype  = ctypes.c_uint32
-_k32.GetTickCount.argtypes        = []
-_k32.GetTickCount.restype         = ctypes.c_uint32
-_k32.GetLastError.argtypes        = []
-_k32.GetLastError.restype         = ctypes.c_uint32
-_k32.GetCurrentThreadId.argtypes  = []
-_k32.GetCurrentThreadId.restype   = ctypes.wintypes.DWORD
+_k32.GetTickCount.argtypes         = []
+_k32.GetTickCount.restype          = ctypes.c_uint32
+_k32.GetLastError.argtypes         = []
+_k32.GetLastError.restype          = ctypes.c_uint32
+_k32.GetCurrentThreadId.argtypes   = []
+_k32.GetCurrentThreadId.restype    = ctypes.wintypes.DWORD
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sleep prevention
@@ -142,8 +172,10 @@ _k32.GetCurrentThreadId.restype   = ctypes.wintypes.DWORD
 def prevent_sleep() -> None:
     _k32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
 
+
 def allow_sleep() -> None:
     _k32.SetThreadExecutionState(ES_CONTINUOUS)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Idle time
@@ -152,9 +184,11 @@ def get_idle_seconds() -> float:
     lii = LASTINPUTINFO()
     lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
     if _u32.GetLastInputInfo(ctypes.byref(lii)):
+        # c_int32 cast handles the 32-bit tick-count wraparound correctly
         elapsed_ms = ctypes.c_int32(_k32.GetTickCount() - lii.dwTime).value
         return max(0, elapsed_ms) / 1000.0
     return 0.0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Window enumeration
@@ -168,97 +202,32 @@ def _enum_cb(hwnd, results):
             results.append((hwnd, buf.value))
     return True
 
+
 _ENUM_PROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.py_object)
+
 
 def find_windows_by_title(pattern: str) -> List[int]:
     """All visible HWNDs whose title contains *pattern* (case-insensitive)."""
-    results = []
+    results: List[tuple] = []
     _u32.EnumWindows(_ENUM_PROC(_enum_cb), ctypes.py_object(results))
     pl = pattern.lower()
     return [h for h, t in results if pl in t.lower()]
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Bring window to front — state-preserving
+# Bring window to front — state-preserving, focus-theft-free
 #
-# Root cause of the original failure:
-#   Windows Vista+ LockSetForegroundWindow() blocks cross-process
-#   SetForegroundWindow / Z-order changes unless the caller's thread shares
-#   input state with the foreground thread.  AttachThreadInput() grants that
-#   temporary sharing, making the raise actually work.
-#
-# State-preservation guarantee:
-#   1. GetWindowPlacement captures showCmd (SW_MAXIMIZE / SW_MINIMIZE / SW_SHOWNORMAL)
-#      and the saved normal rect before we touch anything.
-#   2. SW_RESTORE is called ONLY on minimised windows.  MSDN is explicit:
-#      "If the window is maximized, SW_RESTORE has no effect."  So a window
-#      that was maximised and then minimised comes back maximised.
-#   3. SetWindowPlacement is re-applied at the end as an unconditional
-#      guarantee — even if any intermediate call changed showCmd, this
-#      restores it to the value captured in step 1.
+# Fix summary vs original:
+#   • SW_SHOWNOACTIVATE (4) used for BOTH the minimised and non-minimised
+#     branch.  Unlike SW_SHOWNA (8), it also un-hides a window that is
+#     invisible but not minimised (WS_VISIBLE=0).
+#   • SetWindowPlacement is skipped only for maximised windows (prevents
+#     the OS collapsing them to their saved normal rect).
+#   • SetForegroundWindow removed — we want Z-order raise, not focus theft.
 # ─────────────────────────────────────────────────────────────────────────────
-# def bring_to_front_preserve_state(hwnd: int) -> bool:
-#     try:
-#         # ── 1. Snapshot the current placement ────────────────────────────────
-#         wp = WINDOWPLACEMENT()
-#         wp.length = ctypes.sizeof(WINDOWPLACEMENT)
-#         if not _u32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
-#             log.warning("GetWindowPlacement failed hwnd=%s err=%s",
-#                         hwnd, _k32.GetLastError())
-#             return False
-#         original_show_cmd = wp.showCmd
-#         log.debug("hwnd=%s showCmd=%s before raise", hwnd, original_show_cmd)
-
-#         # ── 2. Attach input queues so foreground lock is bypassed ─────────────
-#         fg_hwnd   = _u32.GetForegroundWindow()
-#         fg_tid    = _u32.GetWindowThreadProcessId(fg_hwnd, None)
-#         target_tid = _u32.GetWindowThreadProcessId(hwnd, None)
-#         our_tid   = _k32.GetCurrentThreadId()
-
-#         attached_fg     = False
-#         attached_target = False
-
-#         if fg_tid and fg_tid != our_tid:
-#             attached_fg = bool(_u32.AttachThreadInput(our_tid, fg_tid, True))
-#         if target_tid and target_tid != our_tid and target_tid != fg_tid:
-#             attached_target = bool(_u32.AttachThreadInput(our_tid, target_tid, True))
-
-#         try:
-#             # ── 3. Un-minimise if needed (SW_RESTORE is safe; see docstring) ──
-#             if _u32.IsIconic(hwnd):
-#                 _u32.ShowWindow(hwnd, SW_RESTORE)
-
-#             # ── 4. Raise Z-order + show without activation ────────────────────
-#             _u32.BringWindowToTop(hwnd)
-#             _u32.SetWindowPos(
-#                 hwnd, HWND_TOP,
-#                 0, 0, 0, 0,
-#                 SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE |
-#                 SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
-#             )
-
-#             # ── 5. Actually set foreground (works because threads are attached) 
-#             _u32.SetForegroundWindow(hwnd)
-
-#         finally:
-#             # ── 6. Always detach, even on exception ───────────────────────────
-#             if attached_fg:
-#                 _u32.AttachThreadInput(our_tid, fg_tid, False)
-#             if attached_target:
-#                 _u32.AttachThreadInput(our_tid, target_tid, False)
-
-#         # ── 7. Unconditionally restore placement → state cannot have changed ──
-#         _u32.SetWindowPlacement(hwnd, ctypes.byref(wp))
-
-#         log.debug("hwnd=%s raised; showCmd restored to %s", hwnd, original_show_cmd)
-#         return True
-
-#     except Exception:
-#         log.error("bring_to_front_preserve_state error:\n%s", traceback.format_exc())
-#         return False
-
 def bring_to_front_preserve_state(hwnd: int) -> bool:
     try:
-        # ── 1. Snapshot the current placement ────────────────────────────────
+        # ── 1. Snapshot placement ────────────────────────────────────────────
         wp = WINDOWPLACEMENT()
         wp.length = ctypes.sizeof(WINDOWPLACEMENT)
         if not _u32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
@@ -268,13 +237,13 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
         original_show_cmd = wp.showCmd
         log.debug("hwnd=%s showCmd=%s before raise", hwnd, original_show_cmd)
 
-        # ── 2. Attach input queues so foreground lock is bypassed ─────────────
-        fg_hwnd   = _u32.GetForegroundWindow()
-        fg_tid    = _u32.GetWindowThreadProcessId(fg_hwnd, None)
+        # ── 2. Attach input queues to bypass foreground lock ─────────────────
+        fg_hwnd    = _u32.GetForegroundWindow()
+        fg_tid     = _u32.GetWindowThreadProcessId(fg_hwnd, None)
         target_tid = _u32.GetWindowThreadProcessId(hwnd, None)
-        our_tid   = _k32.GetCurrentThreadId()
+        our_tid    = _k32.GetCurrentThreadId()
 
-        attached_fg   = False
+        attached_fg     = False
         attached_target = False
 
         if fg_tid and fg_tid != our_tid:
@@ -283,17 +252,12 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
             attached_target = bool(_u32.AttachThreadInput(our_tid, target_tid, True))
 
         try:
-            # ── 3. Handle visibility without activating ───────────────────────
-            if _u32.IsIconic(hwnd):
-                # If minimized, show it without giving it focus
-                _u32.ShowWindow(hwnd, 4)  # 4 = SW_SHOWNOACTIVATE
-            else:
-                # If already visible (Normal or Maximized), just ensure it's visible without focus
-                _u32.ShowWindow(hwnd, 8)  # 8 = SW_SHOWNA
+            # ── 3. Make visible without stealing focus ───────────────────────
+            # SW_SHOWNOACTIVATE (4) handles minimised, normal, maximised, AND
+            # hidden (WS_VISIBLE=0) windows — SW_SHOWNA (8) misses the last case.
+            _u32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
 
-            # ── 4. Raise Z-order safely ──────────────────────────────────────
-            # This shifts the window to the top layout layer without moving, 
-            # resizing, or activating it. Your typing focus stays on the old window.
+            # ── 4. Raise Z-order without size/move/activation ────────────────
             _u32.SetWindowPos(
                 hwnd, HWND_TOP,
                 0, 0, 0, 0,
@@ -302,26 +266,31 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
             )
 
         finally:
-            # ── 5. Always detach input threads ───────────────────────────────
+            # ── 5. Always detach, even on exception ──────────────────────────
             if attached_fg:
                 _u32.AttachThreadInput(our_tid, fg_tid, False)
             if attached_target:
                 _u32.AttachThreadInput(our_tid, target_tid, False)
 
-        # ── 6. State-Preservation Condition ──────────────────────────────────
-        # FIX: If the window was already MAXIMIZED, calling SetWindowPlacement 
-        # breaks the layout. We ONLY restore placement if it wasn't maximized.
+        # ── 6. Restore placement — but NEVER for maximised windows ───────────
+        # Calling SetWindowPlacement on a maximised window forces it to its
+        # saved normal rect, collapsing it.  Skip it; the window is already
+        # in the correct visual state.
         if original_show_cmd != SW_MAXIMIZE:
             _u32.SetWindowPlacement(hwnd, ctypes.byref(wp))
         else:
-            log.debug("hwnd=%s is maximized; skipping SetWindowPlacement to prevent unwanted resizing", hwnd)
+            log.debug(
+                "hwnd=%s maximised — skipping SetWindowPlacement to prevent collapse",
+                hwnd,
+            )
 
-        log.debug("hwnd=%s successfully processed without focus theft or structural changes", hwnd)
+        log.debug("hwnd=%s raised without focus theft", hwnd)
         return True
 
     except Exception:
         log.error("bring_to_front_preserve_state error:\n%s", traceback.format_exc())
         return False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Resource path helper
@@ -331,10 +300,12 @@ def resource_path(relative_path: str) -> str:
         return os.path.join(sys._MEIPASS, relative_path)  # type: ignore
     return os.path.join(os.path.abspath("."), relative_path)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config — candidate locations
 # ─────────────────────────────────────────────────────────────────────────────
 CONFIG_FILENAME = "keepon.ini"
+
 
 def _config_candidates() -> List[Path]:
     candidates: List[Path] = []
@@ -357,12 +328,14 @@ def _config_candidates() -> List[Path]:
     candidates.append(Path.cwd() / CONFIG_FILENAME)
     return candidates
 
+
 def find_config_path() -> Optional[Path]:
     """Return the first existing candidate path, or None."""
     for p in _config_candidates():
         if p.exists():
             return p
     return None
+
 
 def load_config() -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
@@ -380,9 +353,11 @@ def load_config() -> configparser.ConfigParser:
 
     return cfg
 
+
 def _write_default_config(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("""\
+    path.write_text(
+        """\
 [keepon]
 prevent_sleep      = true
 heartbeat_interval = 30
@@ -397,42 +372,81 @@ bring_to_front_windows  =
 [logging]
 level = INFO
 file  =
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sleep preventer thread
+#
+# Fix: interval is now read inside the loop under _lock so a hot-reload
+# from the main thread is race-free.  A dedicated _wake Event lets
+# reload_interval() interrupt the current sleep immediately.
 # ─────────────────────────────────────────────────────────────────────────────
 class SleepPreventer(Thread):
     def __init__(self, interval: float = 30):
         super().__init__(daemon=True, name="SleepPreventer")
         self._stop   = Event()
+        self._wake   = Event()   # set by reload_interval() to abort current sleep early
         self._active = Event()
         self._active.set()
-        self.interval = interval
+        self._lock    = Lock()
+        self._interval = interval
 
+    # ── public API ────────────────────────────────────────────────────────────
     @property
     def is_active(self) -> bool:
         return self._active.is_set()
 
-    def enable(self)  -> None: self._active.set()
+    def enable(self) -> None:
+        self._active.set()
+
     def disable(self) -> None:
         self._active.clear()
         allow_sleep()
 
+    def reload_interval(self, new_interval: float) -> None:
+        """Thread-safe interval update; interrupts the current sleep immediately."""
+        with self._lock:
+            self._interval = new_interval
+        self._wake.set()   # wake the sleeping thread so it picks up the new value
+
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()   # unblock any ongoing wait
 
+    # ── internal ──────────────────────────────────────────────────────────────
     def run(self) -> None:
         log.debug("SleepPreventer started")
-        while not self._stop.wait(timeout=self.interval):
+        while not self._stop.is_set():
             if self._active.is_set():
                 prevent_sleep()
                 log.debug("heartbeat: sleep prevented")
+
+            with self._lock:
+                interval = self._interval
+
+            # Wait for the interval OR an early wake (reload / stop)
+            self._wake.wait(timeout=interval)
+            self._wake.clear()
+
         allow_sleep()
         log.debug("SleepPreventer stopped")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Idle monitor thread
+#
+# Key fixes vs original:
+#   1. Single `_state` string ("active" | "idle_fired") replaces the
+#      was_idle/fired dual-boolean.  A brief mouse wiggle resets to "active"
+#      exactly once; there is no way to fire twice within one idle session.
+#   2. All config fields are snapshotted in ONE lock acquisition at the top
+#      of each poll loop, preventing a hot-reload from racing with a firing
+#      idle action.
+#   3. growl calls are routed through _growl() which no-ops when gntplib
+#      is absent — NameError can no longer silence idle actions.
 # ─────────────────────────────────────────────────────────────────────────────
 class IdleMonitor(Thread):
     def __init__(
@@ -443,34 +457,33 @@ class IdleMonitor(Thread):
         poll_interval: float = 5.0,
     ):
         super().__init__(daemon=True, name="IdleMonitor")
-        self._stop         = Event()
-        self._lock         = Lock()
-        self._threshold    = idle_threshold
-        self._patterns     = window_patterns
-        self._commands     = idle_commands
-        self._poll         = poll_interval
-        self._idle_fired   = False
+        self._stop      = Event()
+        self._lock      = Lock()
+        self._threshold = idle_threshold
+        self._patterns  = window_patterns
+        self._commands  = idle_commands
+        self._poll      = poll_interval
 
     def update_config(
         self,
-        idle_threshold: Optional[float]    = None,
+        idle_threshold: Optional[float]     = None,
         window_patterns: Optional[List[str]] = None,
-        idle_commands: Optional[List[str]] = None,
+        idle_commands: Optional[List[str]]   = None,
     ) -> None:
         with self._lock:
-            if idle_threshold   is not None: self._threshold = idle_threshold
-            if window_patterns  is not None: self._patterns  = window_patterns
-            if idle_commands    is not None: self._commands  = idle_commands
-        log.info("IdleMonitor config updated: threshold=%s patterns=%s cmds=%s",
-                 self._threshold, self._patterns, self._commands)
+            if idle_threshold  is not None: self._threshold = idle_threshold
+            if window_patterns is not None: self._patterns  = window_patterns
+            if idle_commands   is not None: self._commands  = idle_commands
+        log.info(
+            "IdleMonitor config updated: threshold=%s patterns=%s cmds=%s",
+            self._threshold, self._patterns, self._commands,
+        )
 
     def stop(self) -> None:
         self._stop.set()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    def _do_bring_to_front(self) -> None:
-        with self._lock:
-            patterns = list(self._patterns)
+    # ── actions ───────────────────────────────────────────────────────────────
+    def _do_bring_to_front(self, threshold: float, patterns: List[str]) -> None:
         for pattern in patterns:
             pattern = pattern.strip()
             if not pattern:
@@ -481,51 +494,70 @@ class IdleMonitor(Thread):
                 continue
             for hwnd in hwnds:
                 log.info("Raising hwnd=%s for pattern=%r", hwnd, pattern)
+                _growl("info", "KeepOn",
+                       f"[idle={threshold}s] Raising hwnd={hwnd} for pattern={pattern!r}")
                 bring_to_front_preserve_state(hwnd)
 
-    def _do_run_commands(self) -> None:
-        with self._lock:
-            commands = list(self._commands)
+    def _do_run_commands(self, threshold: float, commands: List[str]) -> None:
         for cmd in commands:
             cmd = cmd.strip()
             if not cmd:
                 continue
             log.info("Running idle command: %s", cmd)
+            _growl("info", "KeepOn", f"Running idle ({threshold}s) command: {cmd}")
             try:
                 kwargs: dict = {"shell": True}
                 if platform.system() == "Windows":
                     kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore
                 proc = subprocess.Popen(cmd, **kwargs)  # type: ignore
                 log.debug("Spawned pid=%s", proc.pid)
+                _growl("warning", "KeepOn", f"Spawned pid={proc.pid}")
             except Exception:
                 log.error("Command failed %r:\n%s", cmd, traceback.format_exc())
+                _growl("error", "KeepOn",
+                       f"Command failed: {cmd}\n{traceback.format_exc()}")
 
+    # ── main loop ─────────────────────────────────────────────────────────────
     def run(self) -> None:
         log.debug("IdleMonitor started")
-        was_idle = False
+
+        # Single state variable — eliminates the dual-boolean race.
+        #   "active"     — user is active; watching for idle onset
+        #   "idle_fired" — idle actions already fired; suppressed until activity resets
+        state = "active"
+
         while not self._stop.wait(timeout=self._poll):
-            idle = get_idle_seconds()
+            # ── Snapshot ALL config atomically ────────────────────────────────
+            # One lock scope captures threshold, patterns, and commands together.
+            # A hot-reload arriving mid-loop therefore takes full effect on the
+            # NEXT cycle rather than half-applying (old threshold + new commands).
             with self._lock:
                 threshold   = self._threshold
-                has_windows = any(p.strip() for p in self._patterns)
-                has_cmds    = any(c.strip() for c in self._commands)
+                patterns    = list(self._patterns)
+                commands    = list(self._commands)
+
+            has_windows = any(p.strip() for p in patterns)
+            has_cmds    = any(c.strip() for c in commands)
+
+            idle = get_idle_seconds()
 
             if idle >= threshold:
-                if not was_idle:
-                    log.info("Idle detected: %.1fs >= %.1fs", idle, threshold)
-                    was_idle = True
-                    self._idle_fired = False
-                if not self._idle_fired:
-                    self._idle_fired = True
-                    if has_windows: self._do_bring_to_front()
-                    if has_cmds:    self._do_run_commands()
+                if state == "active":
+                    log.info("Idle detected: %.1fs >= %.1fs — firing actions", idle, threshold)
+                    state = "idle_fired"
+                    if has_windows:
+                        self._do_bring_to_front(threshold, patterns)
+                    if has_cmds:
+                        self._do_run_commands(threshold, commands)
+                # state == "idle_fired" → already fired; do nothing until activity resets
             else:
-                if was_idle:
-                    log.info("Activity resumed (idle was %.1fs)", idle)
-                was_idle = False
-                self._idle_fired = False
+                if state == "idle_fired":
+                    log.info("Activity resumed (idle dropped to %.1fs < %.1fs)", idle, threshold)
+                # Reset unconditionally — any sub-threshold reading re-arms the trigger
+                state = "active"
 
         log.debug("IdleMonitor stopped")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Signals bridge (config reload must touch Qt objects on the main thread)
@@ -533,8 +565,17 @@ class IdleMonitor(Thread):
 class _Signals(QObject):
     config_changed = pyqtSignal()
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Tray application
+#
+# Key fixes vs original:
+#   1. _watcher.fileChanged signal is connected ONCE in __init__, not inside
+#      _watch_config_file(), preventing duplicate signal connections.
+#   2. _watch_config_file() is called from reload_config() too, so the watcher
+#      re-arms itself if the config migrated to a different candidate path.
+#   3. SleepPreventer.interval is updated via reload_interval() which is
+#      thread-safe and immediately interrupts the current sleep.
 # ─────────────────────────────────────────────────────────────────────────────
 class TrayApp:
     def __init__(self):
@@ -568,15 +609,20 @@ class TrayApp:
         self._signals = _Signals()
         self._signals.config_changed.connect(self._on_config_changed)
         self._watcher = QFileSystemWatcher()
+
+        # Connect the signal ONCE here — never inside _watch_config_file().
+        # Connecting inside that method would add a duplicate handler each time
+        # it is called (e.g. on reload), causing N callbacks per file event.
+        self._watcher.fileChanged.connect(self._on_file_changed)
         self._watch_config_file()
 
         # ── tray menu ─────────────────────────────────────────────────────────
         self.menu = QMenu()
 
-        self.start_action  = QAction(QIcon(resource_path("icons/start.ico")), "Start")
-        self.stop_action   = QAction(QIcon(resource_path("icons/stop.ico")),  "Stop")
+        self.start_action  = QAction(QIcon(resource_path("icons/start.ico")),  "Start")
+        self.stop_action   = QAction(QIcon(resource_path("icons/stop.ico")),   "Stop")
         self.reload_action = QAction(QIcon(resource_path("icons/reload.ico")), "Reload Config")
-        self.exit_action   = QAction(QIcon(resource_path("icons/exit.ico")),  "Exit")
+        self.exit_action   = QAction(QIcon(resource_path("icons/exit.ico")),   "Exit")
 
         self.start_action.triggered.connect(self.start_keep_alive)
         self.stop_action.triggered.connect(self.stop_keep_alive)
@@ -593,15 +639,18 @@ class TrayApp:
 
         # ── initial state ─────────────────────────────────────────────────────
         auto_start = self.cfg.getboolean("keepon", "prevent_sleep", fallback=True)
-        self.start_keep_alive(notify=False) if auto_start else self.stop_keep_alive(notify=False)
+        if auto_start:
+            self.start_keep_alive(notify=False)
+        else:
+            self.stop_keep_alive(notify=False)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Config helpers
     # ─────────────────────────────────────────────────────────────────────────
     def _parse_config(self):
-        heartbeat    = self.cfg.getfloat("keepon", "heartbeat_interval", fallback=30)
-        idle_thresh  = self.cfg.getfloat("idle",   "idle_threshold",     fallback=60)
-        raw          = self.cfg.get("idle", "bring_to_front_windows", fallback="")
+        heartbeat   = self.cfg.getfloat("keepon", "heartbeat_interval", fallback=30)
+        idle_thresh = self.cfg.getfloat("idle",   "idle_threshold",     fallback=60)
+        raw         = self.cfg.get("idle", "bring_to_front_windows", fallback="")
         win_patterns = [p.strip() for p in raw.split(",") if p.strip()]
         idle_cmds    = self._load_idle_commands()
         return heartbeat, idle_thresh, win_patterns, idle_cmds
@@ -619,10 +668,11 @@ class TrayApp:
         lvl_str = self.cfg.get("logging", "level", fallback="INFO").upper()
         lvl = getattr(logging, lvl_str, logging.INFO)
         logging.getLogger().setLevel(lvl)
+
         log_file = self.cfg.get("logging", "file", fallback="").strip()
         if log_file:
             root = logging.getLogger()
-            # Avoid duplicate file handlers on reload
+            # Remove any existing file handler to avoid duplicates on reload
             for h in root.handlers[:]:
                 if isinstance(h, logging.FileHandler):
                     root.removeHandler(h)
@@ -637,10 +687,12 @@ class TrayApp:
     # ─────────────────────────────────────────────────────────────────────────
     def _watch_config_file(self) -> None:
         """
-        Watch whichever config file is currently loaded.
-        QFileSystemWatcher.fileChanged fires when the file is modified or
-        replaced (some editors write a new file then rename it — that removes
-        the inode, so we re-add the path on the next event).
+        Add the current config path to the watcher.
+        Called from __init__ and from reload_config() so that if the config
+        file migrates to a different candidate path the watcher follows it.
+
+        NOTE: fileChanged is connected once in __init__ — do NOT connect it
+        here to avoid accumulating duplicate signal handlers across reloads.
         """
         cfg_path = find_config_path()
         if not cfg_path:
@@ -649,18 +701,16 @@ class TrayApp:
         if path_str not in self._watcher.files():
             self._watcher.addPath(path_str)
             log.info("Watching config file: %s", path_str)
-        self._watcher.fileChanged.connect(self._on_file_changed)
 
     def _on_file_changed(self, path: str) -> None:
         """
         Called by Qt in the main thread when the watched file changes.
         Some editors (vim, Notepad++) do a write-rename which removes the
-        old inode — we re-add the path with a short delay to let the rename
+        old inode; we re-add the path after a short delay to let the rename
         complete before reading.
         """
-        log.debug("Config file changed: %s", path)
+        log.debug("Config file changed on disk: %s", path)
 
-        # Re-watch in case the file was replaced (rename-based saves)
         def _re_add():
             if path not in self._watcher.files():
                 self._watcher.addPath(path)
@@ -670,8 +720,9 @@ class TrayApp:
         QTimer.singleShot(200, _re_add)   # 200 ms — enough for rename flush
 
     def _on_config_changed(self) -> None:
-        """Runs in the main thread (via signal) — safe to touch Qt objects."""
-        log.info("Hot-reload triggered")
+        """Runs in the main thread (via Qt signal) — safe to touch Qt objects."""
+        log.info("Hot-reload triggered by file watcher")
+        _growl("reload", "KeepOn", "Config file changed — reloading")
         self.reload_config(notify=True)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -683,16 +734,20 @@ class TrayApp:
 
         heartbeat, idle_thresh, win_patterns, idle_cmds = self._parse_config()
 
-        self.preventer.interval = heartbeat
+        # Thread-safe interval update — interrupts the current sleep immediately
+        self.preventer.reload_interval(heartbeat)
+
         self.idle_monitor.update_config(
             idle_threshold=idle_thresh,
             window_patterns=win_patterns,
             idle_commands=idle_cmds,
         )
 
+        # Re-arm the watcher in case the config path changed
+        self._watch_config_file()
+
         log.info(
-            "Reloaded: heartbeat=%ss idle_threshold=%ss "
-            "patterns=%s commands=%s",
+            "Reloaded: heartbeat=%ss idle_threshold=%ss patterns=%s commands=%s",
             heartbeat, idle_thresh, win_patterns, idle_cmds,
         )
         if notify:
