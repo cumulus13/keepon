@@ -29,7 +29,7 @@ try:
     _growl_icon = Path(__file__).parent / "icons" / "heart.png"
     growl = Publisher(  # type: ignore
         "KeepOn",
-        ["info", "error", "warning", "debug", "reload", "run"],
+        ["info", "error", "warning", "debug", "reload", "run", "reregister"],
         icon=str(_growl_icon),
     )
     try:
@@ -554,6 +554,7 @@ class IdleMonitor(Thread):
 # ─────────────────────────────────────────────────────────────────────────────
 class _Signals(QObject):
     config_changed = pyqtSignal()
+    reregistering = pyqtSignal()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -598,6 +599,7 @@ class TrayApp:
         # ── config hot-reload via QFileSystemWatcher ──────────────────────────
         self._signals = _Signals()
         self._signals.config_changed.connect(self._on_config_changed)
+        self._signals.reregistering.connect(self._on_register_notification)
         self._watcher = QFileSystemWatcher()
 
         # Connect the signal ONCE here — never inside _watch_config_file().
@@ -612,17 +614,21 @@ class TrayApp:
         self.start_action  = QAction(QIcon(resource_path("icons/start.ico")),  "Start")
         self.stop_action   = QAction(QIcon(resource_path("icons/stop.ico")),   "Stop")
         self.reload_action = QAction(QIcon(resource_path("icons/reload.ico")), "Reload Config")
+        self.register_notfication_action = QAction(QIcon(resource_path("icons/notification.ico")), "re-register Notification")
         self.exit_action   = QAction(QIcon(resource_path("icons/exit.ico")),   "Exit")
 
         self.start_action.triggered.connect(self.start_keep_alive)
         self.stop_action.triggered.connect(self.stop_keep_alive)
         self.reload_action.triggered.connect(self.reload_config)
+        self.register_notfication_action.triggered.connect(self.register_notification)
         self.exit_action.triggered.connect(self.exit_app)
 
         self.menu.addAction(self.start_action)
         self.menu.addAction(self.stop_action)
         self.menu.addSeparator()
         self.menu.addAction(self.reload_action)
+        self.menu.addSeparator()
+        self.menu.addAction(self.register_notfication_action)
         self.menu.addSeparator()
         self.menu.addAction(self.exit_action)
         self.tray.setContextMenu(self.menu)
@@ -745,6 +751,24 @@ class TrayApp:
                 "Stay Awake", "Configuration reloaded", QSystemTrayIcon.Information
             )
 
+
+    def _on_register_notification(self) -> None:
+        """Runs in the main thread (via Qt signal) — safe to touch Qt objects."""
+        # This is triggered by the signal bridge
+        self.register_notification()
+        
+    def register_notification(self, checked: bool = False):
+        """Triggered directly by the UI action click or the bridge method."""
+        log.info("Re-register Growl Notification")
+        _growl("reregister", "KeepOn", "Re-register Growl Notification")
+        try:
+            growl.register()
+            _growl("info", "KeepOn", "Re-register Growl Notification successfully")
+            return False
+        except Exception as e:
+            _growl("error", "KeepOn", f"Re-register Growl Notification failed: {e}")
+            return e
+                
     # ─────────────────────────────────────────────────────────────────────────
     # Tray actions
     # ─────────────────────────────────────────────────────────────────────────
