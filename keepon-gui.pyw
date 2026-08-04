@@ -17,6 +17,7 @@ import configparser
 import logging
 import traceback
 from pathlib import Path
+import threading
 from threading import Thread, Event, Lock
 from typing import List, Optional
 
@@ -70,6 +71,7 @@ ES_SYSTEM_REQUIRED  = 0x00000001
 ES_DISPLAY_REQUIRED = 0x00000002
 
 SW_SHOWNOACTIVATE   = 4   # show (any state → visible) without stealing focus
+SW_SHOWMINIMIZED    = 2
 SW_MAXIMIZE         = 3
 
 HWND_TOP            = 0
@@ -170,11 +172,15 @@ _k32.GetCurrentThreadId.restype    = ctypes.wintypes.DWORD
 # Sleep prevention
 # ─────────────────────────────────────────────────────────────────────────────
 def prevent_sleep() -> None:
-    _k32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+    result = _k32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+    log.info("prevent_sleep(): SetThreadExecutionState -> 0x%x (0 = FAILED, err=%s)",
+             result, _k32.GetLastError() if not result else 0)
 
 
 def allow_sleep() -> None:
-    _k32.SetThreadExecutionState(ES_CONTINUOUS)
+    result = _k32.SetThreadExecutionState(ES_CONTINUOUS)
+    log.info("allow_sleep(): SetThreadExecutionState -> 0x%x (0 = FAILED, err=%s)",
+             result, _k32.GetLastError() if not result else 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,11 +274,23 @@ def bring_to_front_preserve_state(hwnd: int) -> bool:
 
         # ── 6. State-Preservation Condition ──────────────────────────────────
         # FIX: If the window was already MAXIMIZED, calling SetWindowPlacement
-        # breaks the layout. We ONLY restore placement if it wasn't maximized.
-        if original_show_cmd != SW_MAXIMIZE:
+        # breaks the layout.
+        # BUGFIX: the original condition only excluded SW_MAXIMIZE, so a
+        # window that started out MINIMIZED (showCmd == SW_SHOWMINIMIZED)
+        # still had `wp` (still holding showCmd == SW_SHOWMINIMIZED) applied
+        # here — un-minimizing it in step 3 and then immediately re-minimizing
+        # it again in this step. That silently defeated "bring to front" for
+        # every minimized window. Skip the restore for maximized AND
+        # minimized originals; only restore for windows that were already
+        # in a normal state.
+        if original_show_cmd not in (SW_MAXIMIZE, SW_SHOWMINIMIZED):
             _u32.SetWindowPlacement(hwnd, ctypes.byref(wp))
         else:
-            log.debug("hwnd=%s is maximized; skipping SetWindowPlacement to prevent unwanted resizing", hwnd)
+            log.debug(
+                "hwnd=%s was maximized/minimized (showCmd=%s); skipping "
+                "SetWindowPlacement restore to avoid undoing the raise",
+                hwnd, original_show_cmd,
+            )
 
         log.debug("hwnd=%s successfully processed without focus theft or structural changes", hwnd)
         return True
@@ -390,11 +408,35 @@ class SleepPreventer(Thread):
         return self._active.is_set()
 
     def enable(self) -> None:
-        self._active.set()
+        # BUGFIX: previously this only set the flag and relied on the next
+        # heartbeat tick (up to `interval` seconds later) to actually call
+        # prevent_sleep(). Apply it immediately, and do it under the same
+        # lock the heartbeat thread uses so the two can never race.
+        log.info(">>> enable() called (thread=%s)", threading.current_thread().name)
+        with self._lock:
+            self._active.set()
+            prevent_sleep()
+        self._wake.set()   # resync the heartbeat thread's wait immediately
+        log.info("<<< enable() done, is_active=%s", self.is_active)
 
     def disable(self) -> None:
-        self._active.clear()
-        allow_sleep()
+        # BUGFIX (the "Stop stops working forever" bug): previously this set
+        # the flag and called allow_sleep() with NO locking against the
+        # heartbeat thread, which independently checks the flag and calls
+        # prevent_sleep() on its own schedule. If that heartbeat check/call
+        # happened to land *after* this disable()'s allow_sleep() (a classic
+        # check-then-act race between two threads), the heartbeat's
+        # prevent_sleep() silently wins and overwrites the "allow sleep"
+        # state back to "prevent sleep" — permanently, since the loop only
+        # ever calls prevent_sleep(), never allow_sleep(), once active is
+        # already False. Locking both sides makes the two calls mutually
+        # exclusive so the last state change always sticks.
+        log.info(">>> disable() called (thread=%s)", threading.current_thread().name)
+        with self._lock:
+            self._active.clear()
+            allow_sleep()
+        self._wake.set()   # resync the heartbeat thread's wait immediately
+        log.info("<<< disable() done, is_active=%s", self.is_active)
 
     def reload_interval(self, new_interval: float) -> None:
         """Thread-safe interval update; interrupts the current sleep immediately."""
@@ -410,18 +452,22 @@ class SleepPreventer(Thread):
     def run(self) -> None:
         log.debug("SleepPreventer started")
         while not self._stop.is_set():
-            if self._active.is_set():
-                prevent_sleep()
-                log.debug("heartbeat: sleep prevented")
-
+            # Check-and-act under the same lock enable()/disable() use, so a
+            # concurrent Start/Stop click can never be raced and overwritten.
             with self._lock:
+                active_now = self._active.is_set()
+                log.info("heartbeat tick (thread=%s): active=%s",
+                         threading.current_thread().name, active_now)
+                if active_now:
+                    prevent_sleep()
                 interval = self._interval
 
-            # Wait for the interval OR an early wake (reload / stop)
+            # Wait for the interval OR an early wake (reload / enable / disable / stop)
             self._wake.wait(timeout=interval)
             self._wake.clear()
 
-        allow_sleep()
+        with self._lock:
+            allow_sleep()
         log.debug("SleepPreventer stopped")
 
 
@@ -760,14 +806,22 @@ class TrayApp:
     def register_notification(self, checked: bool = False):
         """Triggered directly by the UI action click or the bridge method."""
         log.info("Re-register Growl Notification")
+        # BUGFIX: this used to call growl.register() unconditionally. On a
+        # machine where gntplib isn't installed, `growl` is never defined
+        # (see the import try/except at module load), so clicking this menu
+        # item raised a NameError instead of failing gracefully.
+        if not HAS_GNTPLIB:
+            log.warning("gntplib unavailable — cannot re-register notifications")
+            return False
         _growl("reregister", "KeepOn", "Re-register Growl Notification")
         try:
             growl.register()
             _growl("info", "KeepOn", "Re-register Growl Notification successfully")
-            return False
+            return True
         except Exception as e:
+            log.error("Re-register Growl Notification failed:\n%s", traceback.format_exc())
             _growl("error", "KeepOn", f"Re-register Growl Notification failed: {e}")
-            return e
+            return False
                 
     # ─────────────────────────────────────────────────────────────────────────
     # Tray actions
